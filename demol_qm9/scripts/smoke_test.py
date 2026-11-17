@@ -73,7 +73,9 @@ from demol.model import DeMol, MaskedMultiHeadAttention, count_parameters  # noq
 from demol.qm9 import (  # noqa: E402
     N_TARGETS,
     QM9Dataset,
+    parse_qm9_file,
     qm9_collate,
+    verify_target_columns,
     write_cache,
 )
 from demol.trainer import Trainer  # noqa: E402
@@ -876,9 +878,65 @@ def check_benchmark_reporting() -> list[str]:
     return notes
 
 
+def check_qm9_xyz_layout() -> list[str]:
+    """真实 figshare 版式（原子块紧跟表头）的 xyz 必须能被正确解析。
+
+    回归测试：parse_qm9_file 曾假设 SMILES/InChI 在原子块之前
+    （lines[4:4+n]），而真实 dsgdb9nsd_*.xyz 的原子块从 lines[2] 开始，
+    会导致全部文件解析失败。现在按"第一条像原子的行"定位原子块，
+    两种版式都应解析出 5 个原子。
+    """
+    # gdb_1 甲烷的真实表头数值（DeepChem gdb9.sdf.csv 第一行）
+    header = ("gdb 1 157.7118 157.70997 157.70699 0 13.21 -0.3877 0.1171 0.5048 "
+              "35.3641 0.044749 -40.47893 -40.476062 -40.475117 -40.498597 6.469 "
+              "-395.999594594 -398.643290011 -401.014646522 -372.471772148")
+    atom_block = (
+        "C -0.0127014359 1.0858041578 0.0080009958 0.1197598914\n"
+        "H 0.0021504160 -0.0060313176 0.0019761204 0.0226801748\n"
+        "H 1.0117308433 1.4637511618 0.0002765748 0.0178689532\n"
+        "H -0.5408150690 1.4475266138 -0.8766437152 0.0196477771\n"
+        "H -0.5238136345 1.4379326443 0.9063972942 0.0200431924"
+    )
+    # 真实版式：表头 -> 原子 -> 频率 -> SMILES -> InChI
+    standard = f"5\n{header}\n{atom_block}\n696.5348 1298.0 1320.0 1320.0\nC C\nInChI=1S/CH4/h1H4\n"
+    # 变体：SMILES/InChI 在原子块之前
+    swapped = f"5\n{header}\nC C\nInChI=1S/CH4/h1H4\n{atom_block}\n"
+
+    notes: list[str] = []
+    tmpdir = _scratch_dir("xyz_layout_")
+    try:
+        for name, text in (("standard", standard), ("swapped", swapped)):
+            path = os.path.join(tmpdir, f"dsgdb9nsd_000001_{name}.xyz")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            index, z, pos, raw, extra = parse_qm9_file(path)
+            if index != 1 or z.shape[0] != 5 or pos.shape != (5, 3):
+                notes.append(f"FAIL {name}: index={index} n={z.shape[0]} pos={pos.shape}")
+            if z.tolist() != [6, 1, 1, 1, 1]:
+                notes.append(f"FAIL {name}: 元素序列 {z.tolist()}")
+            if verify_target_columns(raw) is not None:
+                notes.append(f"FAIL {name}: {verify_target_columns(raw)}")
+        # 原子块内混入非原子行时必须报错而不是静默跳过
+        bad = f"5\n{header}\nC 0 0 0 0\nH 0 0 1 0\nbroken-line\nH 0 1 0 0\nH 1 0 0 0\n"
+        bad_path = os.path.join(tmpdir, "bad.xyz")
+        with open(bad_path, "w", encoding="utf-8") as fh:
+            fh.write(bad)
+        try:
+            parse_qm9_file(bad_path)
+            notes.append("FAIL 损坏的原子块没有报错")
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    notes.insert(0, "standard / swapped 两种版式均解析出 5 原子、20 个原始属性，"
+                    "gap=lumo-homo 校验通过；损坏原子块正确报错")
+    return notes
+
+
 CHECKS: tuple[tuple[str, Callable[[], list[str]]], ...] = (
     ("bond_perception", check_bond_perception),
     ("bond_order_bands", check_bond_order_bands),
+    ("qm9_xyz_layout", check_qm9_xyz_layout),
     ("featurizer_vocab", check_featurizer_vocab),
     ("numpy_torch_parity", check_numpy_torch_parity),
     ("gaussian_basis", check_gaussian_basis),

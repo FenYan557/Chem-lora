@@ -69,27 +69,76 @@ N_TEST = 10_831
 # --------------------------------------------------------------------------
 # raw xyz parsing
 # --------------------------------------------------------------------------
+def _is_atom_line(line: str) -> bool:
+    """True when the line looks like ``<element> <x> <y> <z> [charge]``."""
+    parts = line.split()
+    if len(parts) < 4 or parts[0] not in chem.SYMBOL_TO_Z:
+        return False
+    try:
+        float(parts[1])
+        float(parts[2])
+        float(parts[3])
+    except ValueError:
+        return False
+    return True
+
+
+def _all_floats(line: str) -> bool:
+    try:
+        [float(t) for t in line.split()]
+        return True
+    except ValueError:
+        return False
+
+
 def parse_qm9_file(path: str) -> tuple[int, np.ndarray, np.ndarray, list[str], list[str]]:
     """Parse one QM9 ``.xyz`` record.
 
-    Returns (index, atomic_numbers, pos, raw_values, [smiles, inchi]).
+    Standard figshare layout (sdata201422)::
+
+        line 0            number of atoms
+        line 1            "gdb <index>" followed by 15-21 scalar properties
+        lines 2..2+n      element, x, y, z [, Mulliken charge]
+        line 2+n          harmonic vibrational frequencies (optional)
+        line 2+n+1        SMILES (optional)
+        line 2+n+2        InChI (optional)
+
+    The atom block is located by scanning for the first atom-looking line,
+    so variants with extra comment/SMILES lines before the coordinates also
+    parse correctly.  Returns (index, atomic_numbers, pos, raw_values,
+    [smiles, inchi]); SMILES/InChI are best-effort metadata only.
     """
     with open(path, "r", encoding="utf-8") as fh:
         lines = fh.read().splitlines()
     n_atoms = int(lines[0].strip())
     header = lines[1].split()
-    index = int(header[1])
-    raw = np.array([float(v) for v in header[2:]], dtype=np.float64)
-    smiles = lines[2].strip() if len(lines) > 2 else ""
-    inchi = lines[3].strip() if len(lines) > 3 else ""
+    if len(header) >= 2 and not header[0].lstrip("+-").isdigit():
+        index = int(header[1])
+        raw = np.array([float(v) for v in header[2:]], dtype=np.float64)
+    else:  # header without the leading "gdb" tag
+        index = int(header[0])
+        raw = np.array([float(v) for v in header[1:]], dtype=np.float64)
+    start = None
+    for i in range(2, len(lines)):
+        if _is_atom_line(lines[i]):
+            start = i
+            break
+    if start is None:
+        raise ValueError(f"{path}: no atom block found")
     symbols: list[str] = []
     coords: list[list[float]] = []
-    for line in lines[4 : 4 + n_atoms]:
+    for line in lines[start : start + n_atoms]:
         parts = line.split()
-        if len(parts) < 4:
-            continue
+        if not _is_atom_line(line):
+            raise ValueError(f"{path}: atom block truncated or misaligned")
         symbols.append(parts[0])
         coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    # best-effort SMILES / InChI after the atom block (skip frequencies)
+    rest = [ln.strip() for ln in lines[start + n_atoms :] if ln.strip()]
+    if rest and _all_floats(rest[0]):
+        rest = rest[1:]
+    smiles = rest[0] if rest else ""
+    inchi = rest[1] if len(rest) > 1 else ""
     z = np.array([chem.SYMBOL_TO_Z.get(s, 0) for s in symbols], dtype=np.int64)
     if z.shape[0] != n_atoms or (z == 0).any():
         raise ValueError(f"{path}: unsupported element or malformed coordinate block")

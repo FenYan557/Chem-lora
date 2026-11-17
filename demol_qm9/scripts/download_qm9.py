@@ -1,18 +1,28 @@
 #!/usr/bin/env python
-"""Download and unpack QM9 (133,885 molecules, ~1.6 GB compressed).
+"""Download and unpack QM9 (133,885 molecules).
 
-Two sources are wired up:
+Sources wired up:
 
 ``figshare`` (default)  https://figshare.com/ndownloader/files/3195389
                         the ``dsgdb9nsd.xyz.tar`` archive used by every QM9
                         paper, containing one ``.xyz`` file per molecule.
-``deepchem``            the DeepChem S3 mirror of ``gdb9.tar.gz``; same
-                        molecule files, different archive layout.
+``deepchem``            DeepChem's S3 mirror ``gdb9.tar.gz``.  NOTE: despite
+                        the name this contains ``gdb9.sdf`` + ``gdb9.sdf.csv``
+                        (not per-molecule xyz), so it must be converted with
+                        ``scripts/sdf_to_xyz.py`` afterwards.
+``moldata``             the same DeepChem archive re-hosted on HuggingFace
+                        (``liuganghuggingface/moldata-qm9``) as
+                        ``structures/qm9.tar.gz`` (53 MB); also needs
+                        ``scripts/sdf_to_xyz.py``.
+``moldata-mirror``      identical file via hf-mirror.com (reachable from
+                        China-datacenter servers where huggingface.co and
+                        figshare are blocked).
 
 Usage::
 
     python scripts/download_qm9.py --out data/qm9
     python scripts/download_qm9.py --out data/qm9 --source deepchem
+    python scripts/download_qm9.py --out data/qm9 --source moldata-mirror
 
 The script is resumable: an existing archive is re-used unless ``--force``.
 Network access is required, so on a sandboxed machine run it with escalated
@@ -36,6 +46,14 @@ SOURCES = {
     "deepchem": (
         "https://deepchemdata.s3-us-west-1.amazonaws.com/datasets/gdb9.tar.gz",
         "gdb9.tar.gz",
+    ),
+    "moldata": (
+        "https://huggingface.co/datasets/liuganghuggingface/moldata-qm9/resolve/main/structures/qm9.tar.gz",
+        "qm9_sdf.tar.gz",
+    ),
+    "moldata-mirror": (
+        "https://hf-mirror.com/datasets/liuganghuggingface/moldata-qm9/resolve/main/structures/qm9.tar.gz",
+        "qm9_sdf.tar.gz",
     ),
 }
 
@@ -105,6 +123,19 @@ def main(argv: list[str] | None = None) -> int:
 
     xyz_dir = find_xyz_dir(args.out)
     if xyz_dir is None:
+        sdf = None
+        csv = None
+        for dirpath, _dirnames, filenames in os.walk(args.out):
+            for f in filenames:
+                if f.endswith(".sdf"):
+                    sdf = os.path.join(dirpath, f)
+                elif f.endswith(".sdf.csv"):
+                    csv = os.path.join(dirpath, f)
+        if sdf and csv:
+            print("[info] archive holds SDF + CSV (DeepChem layout); convert it with:")
+            print(f"\n    python scripts/sdf_to_xyz.py --sdf \"{sdf}\" --csv \"{csv}\" \\")
+            print(f"        --out-dir {os.path.join(args.out, 'dsgdb9nsd.xyz')}\n")
+            return 0
         print("[warn] no directory with >1000 .xyz files found under "
               f"{args.out}; inspect the archive layout manually.")
         return 1
