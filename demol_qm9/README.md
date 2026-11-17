@@ -149,7 +149,7 @@ python scripts/run_pretrain.py --cache-dir data/qm9_cache --preset base --scale 
 | --- | --- | --- |
 | Sec. 3.2, Fig. 3 | 原子通道 + 化学键通道（线图）双图表示 | `model.py: DeMol`（`h_a` / `h_b` 两条 token 序列） |
 | Appendix B, Alg. 1 | 基于共价半径的成键判定，`d_ij < α(r_i+r_j)`，α=1.15 | `chem.py: perceive_bonds`，`BOND_THRESHOLD_ALPHA = 1.15` |
-| Sec. 3.2 "Structure-aware Mask" | 只保留 5 Å 内的原子对，剪掉非物理远场 | `chem.py: ATOM_MASK_CUTOFF_ANGSTROM = 5.0` → `qm9.py: qm9_collate` 的 `aa_mask` |
+| Sec. 3.2 "Structure-aware Mask" | 稀疏注意力掩码：原子对只保留 5 Å 内+成键，键对只保留邻接+共轭两跳，交叉只保留原子-键关联 | `chem.py: ATOM_MASK_CUTOFF_ANGSTROM = 5.0` → `qm9.py: qm9_collate` 的 `aa/bb/ab_mask` → `model.py` 注意力的 `pair_mask` 参数 |
 | eq. (5) | 高斯基核展开 `exp(-α(x-μ_k)²/σ_k²)`，α/β 按原子类型对索引 | `encoding.py: GaussianBasis, ScalarBasisEncoder` |
 | eq. (6) | 原子自注意力 + `Φ^(l) = Φ_dist + Φ_SPD` | `encoding.py: AtomStructureEncoding` → `model.py` 原子自注意力子层 |
 | eq. (7)(8) | 化学键自注意力 + `Φ_b = Φ_dist + Φ_SPD + Φ_tors` | `encoding.py: BondStructureEncoding, torsion_cosine` |

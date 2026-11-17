@@ -69,7 +69,7 @@ from demol.features import (  # noqa: E402
     N_BOND_CLASSES,
 )
 from demol.losses import DeMolLoss, TargetStandardizer  # noqa: E402
-from demol.model import DeMol, count_parameters  # noqa: E402
+from demol.model import DeMol, MaskedMultiHeadAttention, count_parameters  # noqa: E402
 from demol.qm9 import (  # noqa: E402
     N_TARGETS,
     QM9Dataset,
@@ -270,6 +270,29 @@ def check_bond_perception() -> list[str]:
         notes.append(f"FAIL 键恢复率 {recovered}/{total_edges}")
     notes.insert(0, f"12 个分子共 {total_edges} 条键全部恢复，虚假重原子键 {spurious} 条；"
                     "键长比 -> 键级判定全部为单键")
+    return notes
+
+
+def check_bond_order_bands() -> list[str]:
+    """键长比 -> 键级的四个区间必须各自命中。
+
+    回归测试：bond_order_from_ratio 曾按升序逐轮覆写，宽区间（芳香 0.965）
+    把窄区间冲掉，双键/三键永远不会被判出。np.select 的"首个命中生效"语义
+    才是正确的。这里的采样点含 chem.py 注释里的标定值（C#C 0.789 -> 3，
+    C=C 0.875 -> 2，芳香 0.914 -> 4）与各边界两侧。
+    """
+    notes: list[str] = []
+    ratio = np.array(
+        [0.789, 0.80, 0.824, 0.83, 0.875, 0.89, 0.914, 0.96, 0.966, 1.00, 1.10],
+        dtype=np.float32,
+    )
+    expect = [3, 3, 3, 2, 2, 2, 4, 4, 1, 1, 1]
+    got = chem.bond_order_from_ratio(ratio).tolist()
+    if got != expect:
+        notes.append(f"FAIL 键级判定 {got} != 期望 {expect}")
+    counts = {v: got.count(v) for v in (1, 2, 3, 4)}
+    notes.insert(0, f"11 个采样点四区间全部命中：单键 {counts[1]}、双键 {counts[2]}、"
+                    f"三键 {counts[3]}、芳香 {counts[4]}（含 C#C/C=C/芳香标定值与边界）")
     return notes
 
 
@@ -597,6 +620,56 @@ def check_forward_shapes() -> list[str]:
     return notes
 
 
+def check_structure_mask_wiring() -> list[str]:
+    """结构感知掩码必须真的约束注意力（论文 3.2 节/附录 C），不能算出来没人用。
+
+    回归测试：aa/bb/ab_mask 曾一度只被 collate 计算、forward 原样返回，
+    注意力实际是全连接的。
+    """
+    notes: list[str] = []
+    # 单元级：pair_mask = 单位阵时每个 query 只剩自己一个 key，softmax 恒为 1，
+    # 注意力输出必须精确等于 o_proj(v_proj(x))，与 q/k 完全无关。
+    torch.manual_seed(3)
+    attn = MaskedMultiHeadAttention(16, 16, 4, 4, 0.0).eval()
+    x = torch.randn(2, 5, 16)
+    key_mask = torch.ones(2, 5, dtype=torch.bool)
+    eye = torch.eye(5, dtype=torch.bool)[None].expand(2, 5, 5)
+    with torch.no_grad():
+        masked = attn(x, x, None, key_mask, eye)
+        ref = attn.o_proj(attn.v_proj(x))
+        dense = attn(x, x, None, key_mask)
+    if not torch.allclose(masked, ref, atol=1e-5):
+        notes.append("FAIL pair_mask=I 时输出 != o_proj(v(x))，掩码未进入注意力")
+    if torch.allclose(masked, dense, atol=1e-6):
+        notes.append("FAIL pair_mask=I 与全连接输出相同，掩码形同虚设")
+
+    # 集成级：同一份 batch，真实结构掩码 vs 全连接掩码，prop 必须不同且有限。
+    cache_dir, _ = _build_temp_cache(4, seed=23)
+    ds = None
+    try:
+        ds = QM9Dataset(cache_dir, split_ids=(0,))
+        batch = qm9_collate([ds[i] for i in range(len(ds))])
+        model = DeMol(model_config("smoke")).eval()
+        am, bm = batch["atom_mask"].bool(), batch["bond_mask"].bool()
+        dense_batch = dict(batch)
+        dense_batch["aa_mask"] = am[:, :, None] & am[:, None, :]
+        dense_batch["bb_mask"] = bm[:, :, None] & bm[:, None, :]
+        dense_batch["ab_mask"] = am[:, :, None] & bm[:, None, :]
+        with torch.no_grad():
+            p_real = model(batch)["prop"]
+            p_dense = model(dense_batch)["prop"]
+        if not (bool(torch.isfinite(p_real).all()) and bool(torch.isfinite(p_dense).all())):
+            notes.append("FAIL 结构掩码接入后 prop 出现 NaN/Inf")
+        diff = float((p_real - p_dense).abs().max())
+        if diff < 1e-6:
+            notes.append("FAIL 真实掩码与全连接掩码的 prop 相同，掩码没有生效")
+        notes.insert(0, f"pair_mask=I 恒等式成立（注意力退化为 o_proj(v(x))）；"
+                        f"真实掩码 vs 全连接的 prop 最大差异 {diff:.3g}")
+    finally:
+        _cleanup([cache_dir], [ds])
+    return notes
+
+
 def check_loss_and_backward() -> list[str]:
     """四个损失都参与、都有限，反向传播没有 NaN/Inf。"""
     notes: list[str] = []
@@ -805,11 +878,13 @@ def check_benchmark_reporting() -> list[str]:
 
 CHECKS: tuple[tuple[str, Callable[[], list[str]]], ...] = (
     ("bond_perception", check_bond_perception),
+    ("bond_order_bands", check_bond_order_bands),
     ("featurizer_vocab", check_featurizer_vocab),
     ("numpy_torch_parity", check_numpy_torch_parity),
     ("gaussian_basis", check_gaussian_basis),
     ("collate_padding", check_collate_padding),
     ("forward_shapes", check_forward_shapes),
+    ("structure_mask_wiring", check_structure_mask_wiring),
     ("loss_and_backward", check_loss_and_backward),
     ("training_and_eval", check_training_and_eval),
     ("config_overrides", check_config_overrides),

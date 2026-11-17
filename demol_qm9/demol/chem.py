@@ -113,11 +113,16 @@ BOND_ORDER_BANDS = (
 
 
 def bond_order_from_ratio(ratio: np.ndarray) -> np.ndarray:
-    """Map length ratios to {1, 2, 3, 4=aromatic} without a chemistry toolkit."""
-    order = np.ones_like(np.asarray(ratio, dtype=np.float32), dtype=np.int8)
-    for cutoff, value in sorted(BOND_ORDER_BANDS, key=lambda kv: kv[0]):
-        order[ratio < cutoff] = value
-    return order
+    """Map length ratios to {1, 2, 3, 4=aromatic} without a chemistry toolkit.
+
+    np.select 取第一个命中的条件，因此 cutoff 按升序传入、最严（键长最短）
+    的区间优先生效。不要写成逐轮覆写：宽区间的掩码是窄区间的超集，升序覆写
+    会把双键/三键全部冲成芳香键（2026-11 修掉的 bug）。
+    """
+    r = np.asarray(ratio, dtype=np.float32)
+    bands = sorted(BOND_ORDER_BANDS, key=lambda kv: kv[0])
+    conds = [r < cutoff for cutoff, _ in bands]
+    return np.select(conds, [value for _, value in bands], default=1).astype(np.int8)
 
 
 def fundamental_cycles(adj: np.ndarray) -> list[list[int]]:

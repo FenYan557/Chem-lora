@@ -46,7 +46,12 @@ from .features import (
     N_BOND_CLASSES,
 )
 
-__all__ = ["DeMolConfig", "DeMol", "count_parameters"]
+__all__ = [
+    "DeMolConfig",
+    "DeMol",
+    "MaskedMultiHeadAttention",
+    "count_parameters",
+]
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +175,7 @@ class MaskedMultiHeadAttention(nn.Module):
         key_value: torch.Tensor,
         bias: torch.Tensor | None,
         key_mask: torch.Tensor,
+        pair_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, x, _ = query.shape
         y = key_value.shape[1]
@@ -185,6 +191,11 @@ class MaskedMultiHeadAttention(nn.Module):
             logits = logits + bias
 
         km = key_mask[:, None, None, :]                      # (B, 1, 1, Y)
+        if pair_mask is not None:
+            # 结构感知掩码（论文 3.2 节）：(B, X, Y) 成对稀疏规则与 padding
+            # 掩码取交——原子通道 5 Å 截断+成键，键通道邻接+共轭两跳，
+            # 交叉通道只保留原子-键关联。
+            km = km & pair_mask[:, None, :, :]               # (B, 1, X, Y)
         logits = logits.masked_fill(~km, torch.finfo(logits.dtype).min)
         attn = torch.softmax(logits, dim=-1)
         # a row with no valid key would otherwise become uniform noise
@@ -241,22 +252,31 @@ class SubLayer(nn.Module):
         ctx: torch.Tensor | None,
         bias: torch.Tensor | None,
         key_mask: torch.Tensor,
+        pair_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.pre_ln:
             hq = self.ln_attn(x)
             hc = hq if ctx is None else (self.ctx_norm(ctx) if self.ctx_norm else ctx)
-            x = x + self.drop_attn(self.attn(hq, hc, bias, key_mask))
+            x = x + self.drop_attn(self.attn(hq, hc, bias, key_mask, pair_mask))
             if self.ffn is not None:
                 x = x + self.drop_ffn(self.ffn(self.ln_ffn(x)))
         else:
-            x = self.ln_attn(x + self.drop_attn(self.attn(x, x if ctx is None else ctx, bias, key_mask)))
+            x = self.ln_attn(x + self.drop_attn(
+                self.attn(x, x if ctx is None else ctx, bias, key_mask, pair_mask)
+            ))
             if self.ffn is not None:
                 x = self.ln_ffn(x + self.drop_ffn(self.ffn(x)))
         return x
 
 
 class DoubleHelixBlock(nn.Module):
-    """Atom self-attn, bond self-attn, then both cross-attentions (eqs. 6-10)."""
+    """Atom self-attn, bond self-attn, then both cross-attentions (eqs. 6-10).
+
+    四条注意力路径各自带结构感知掩码（论文 3.2 节的 sparse attention mask）：
+    原子自注意力用 ``aa_mask``（5 Å 截断+成键），键自注意力用 ``bb_mask``
+    （线图邻接+共轭两跳），两条交叉注意力共用 ``ab_mask``（原子-键关联，
+    键->原子方向取转置）。
+    """
 
     def __init__(self, cfg: DeMolConfig):
         super().__init__()
@@ -295,11 +315,16 @@ class DoubleHelixBlock(nn.Module):
         bias_ba: torch.Tensor,
         atom_mask: torch.Tensor,
         bond_mask: torch.Tensor,
+        aa_mask: torch.Tensor,
+        bb_mask: torch.Tensor,
+        ab_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h_a1 = self.atom_self(h_a, None, phi_a, atom_mask)
-        h_b1 = self.bond_self(h_b, None, phi_b, bond_mask)
-        h_a2 = self.atom_cross(h_a1, h_b1, bias_ab, bond_mask)
-        h_b2 = self.bond_cross(h_b1, h_a1, bias_ba, atom_mask)
+        # 结构感知掩码（论文 3.2 节）：aa = 5 Å 截断+成键+自身；
+        # bb = 线图邻接+共轭两跳+自身；ab = 原子-键关联（交叉两个方向共用）
+        h_a1 = self.atom_self(h_a, None, phi_a, atom_mask, aa_mask)
+        h_b1 = self.bond_self(h_b, None, phi_b, bond_mask, bb_mask)
+        h_a2 = self.atom_cross(h_a1, h_b1, bias_ab, bond_mask, ab_mask)
+        h_b2 = self.bond_cross(h_b1, h_a1, bias_ba, atom_mask, ab_mask.transpose(1, 2))
         return h_a2, h_b2
 
 
@@ -389,7 +414,8 @@ class DeMol(nn.Module):
         """For atom ``i`` and incident bond ``(u, v)``, the endpoint != ``i``.
 
         Returns (B, N, M).  Entries where the bond is not incident to ``i`` are
-        arbitrary and are excluded by the atom-bond attention mask.
+        arbitrary; they never reach the attention because the cross-attention
+        pair mask (``ab_mask``，原子-键关联）把这些位置屏蔽掉了。
         """
         b, m, _ = bond_idx.shape
         ar = torch.arange(n_atoms, device=bond_idx.device)[None, :, None].expand(b, n_atoms, m)
@@ -508,10 +534,14 @@ class DeMol(nn.Module):
                 h_a, h_b = torch_checkpoint(
                     block,
                     h_a, h_b, phi_a, phi_b, b_ab, b_ba, atom_mask, bond_mask,
+                    aa_mask, bb_mask, ab_mask,
                     use_reentrant=False,
                 )
             else:
-                h_a, h_b = block(h_a, h_b, phi_a, phi_b, b_ab, b_ba, atom_mask, bond_mask)
+                h_a, h_b = block(
+                    h_a, h_b, phi_a, phi_b, b_ab, b_ba, atom_mask, bond_mask,
+                    aa_mask, bb_mask, ab_mask,
+                )
 
         h_a = self.final_norm_a(h_a)
         h_b = self.final_norm_b(h_b)
