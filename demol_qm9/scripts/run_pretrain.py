@@ -28,7 +28,12 @@
     python scripts/run_pretrain.py --preset small --scale local ^
         --cache-dir data/qm9_cache --out-dir runs/pretrain_small
 
-    # 论文配置（需要多卡；batch 1024 / 1.5M step）
+    # 论文配置（4 卡 DDP + bf16；batch_size 是每卡的，全局 = 每卡 × 卡数）
+    torchrun --nproc_per_node=4 scripts/run_pretrain.py --preset paper \
+        --cache-dir data/qm9_cache --out-dir runs/pretrain_paper \
+        --set-train batch_size=256 total_steps=50000 amp=bf16
+
+    # 单卡跑论文配置（全局 batch 1024）
     python scripts/run_pretrain.py --preset paper --scale paper ^
         --cache-dir data/qm9_cache --out-dir runs/pretrain_paper
 
@@ -54,6 +59,7 @@ from run_common import (  # noqa: E402
     add_common_args,
     build_configs,
     build_run,
+    ddp_cleanup,
     describe_environment,
     export_ema_checkpoint,
     make_logger,
@@ -101,23 +107,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.eval_every is not None:
         run.trainer.cfg.eval_every = args.eval_every
 
-    log, handle = make_logger(run.train_cfg.out_dir)
+    log, handle = make_logger(run.train_cfg.out_dir, enabled=run.is_main)
     try:
         env = describe_environment(run.device)
         log(f"[info] DeMol 预训练 (QM9 多任务)  stage=pretrain preset={args.preset} scale={args.scale}")
         log(f"[info] env: {env}")
+        if run.world_size > 1:
+            log(f"[info] DDP: world_size={run.world_size}, "
+                f"per-gpu batch={run.train_cfg.batch_size}, "
+                f"global batch={run.train_cfg.batch_size * run.world_size}")
         log(f"[info] cache: {args.cache_dir}")
         log(f"[info] split sizes: train={len(run.data.datasets['train'])} "
             f"val={len(run.data.datasets['val'])} test={len(run.data.datasets['test'])}")
         log(f"[info] targets: {', '.join(selected_target_names(run.loss_cfg))}")
-        print_param_summary(run.model, "pretrain")
+        if run.is_main:
+            print_param_summary(run.model, "pretrain")
 
-        std_path = os.path.join(run.train_cfg.out_dir, "standardizer.json")
-        run.standardizer.save(std_path)
-        log(f"[ok  ] 标签标准化统计量 -> {std_path}")
-        save_run_config(run.train_cfg.out_dir, run.model_cfg, run.train_cfg, run.loss_cfg,
-                        extra={"stage": "pretrain", "environment": env,
-                               "cache_dir": os.path.abspath(args.cache_dir)})
+            std_path = os.path.join(run.train_cfg.out_dir, "standardizer.json")
+            run.standardizer.save(std_path)
+            log(f"[ok  ] 标签标准化统计量 -> {std_path}")
+            save_run_config(run.train_cfg.out_dir, run.model_cfg, run.train_cfg, run.loss_cfg,
+                            extra={"stage": "pretrain", "environment": env,
+                                   "cache_dir": os.path.abspath(args.cache_dir)})
 
         if args.resume:
             payload = run.trainer.load_checkpoint(args.resume)
@@ -133,17 +144,19 @@ def main(argv: list[str] | None = None) -> int:
             targets=selected_target_names(run.loss_cfg),
             log=log,
         )
-        ema_path = os.path.join(run.train_cfg.out_dir, "ema_model.pt")
-        if export_ema_checkpoint(run.trainer, ema_path):
-            log(f"[ok  ] EMA 权重 -> {ema_path}")
-        write_json(
-            os.path.join(run.train_cfg.out_dir, "final_metrics.json"),
-            {"steps": result["steps"], "splits": metrics,
-             "history": result["history"][-20:]},
-        )
-        log("[next] python scripts/run_finetune.py "
-            f"--pretrained {ema_path} --preset {args.preset} --targets gap")
+        if run.is_main:
+            ema_path = os.path.join(run.train_cfg.out_dir, "ema_model.pt")
+            if export_ema_checkpoint(run.trainer, ema_path):
+                log(f"[ok  ] EMA 权重 -> {ema_path}")
+            write_json(
+                os.path.join(run.train_cfg.out_dir, "final_metrics.json"),
+                {"steps": result["steps"], "splits": metrics,
+                 "history": result["history"][-20:]},
+            )
+            log("[next] python scripts/run_finetune.py "
+                f"--pretrained {ema_path} --preset {args.preset} --targets gap")
     finally:
+        ddp_cleanup(run.world_size)
         handle.close()
     return 0
 

@@ -56,6 +56,7 @@ from run_common import (  # noqa: E402
     add_common_args,
     build_configs,
     build_run,
+    ddp_cleanup,
     describe_environment,
     export_ema_checkpoint,
     make_logger,
@@ -186,21 +187,26 @@ def main(argv: list[str] | None = None) -> int:
         return _dry_run(args)
 
     run = build_run(args, "finetune")
-    log, handle = make_logger(run.train_cfg.out_dir)
+    log, handle = make_logger(run.train_cfg.out_dir, enabled=run.is_main)
     try:
         env = describe_environment(run.device)
         targets = selected_target_names(run.loss_cfg)
         log(f"[info] DeMol 微调 (QM9)  preset={args.preset} scale={args.scale} "
             f"targets={','.join(targets)}")
         log(f"[info] env: {env}")
+        if run.world_size > 1:
+            log(f"[info] DDP: world_size={run.world_size}, "
+                f"per-gpu batch={run.train_cfg.batch_size}, "
+                f"global batch={run.train_cfg.batch_size * run.world_size}")
         log(f"[info] split sizes: train={len(run.data.datasets['train'])} "
             f"val={len(run.data.datasets['val'])} test={len(run.data.datasets['test'])}")
-        print_param_summary(run.model, "finetune")
+        if run.is_main:
+            print_param_summary(run.model, "finetune")
 
         if args.standardizer:
             run.trainer.standardizer = TargetStandardizer.load(args.standardizer)
             log(f"[init] 复用标签标准化统计量: {args.standardizer}")
-        else:
+        elif run.is_main:
             run.standardizer.save(os.path.join(run.train_cfg.out_dir, "standardizer.json"))
 
         transfer: dict[str, Any] | None = None
@@ -215,22 +221,23 @@ def main(argv: list[str] | None = None) -> int:
         else:
             log("[init] 未提供 --pretrained：从零微调（论文 Table 8 的 No Pre-training 对照）")
 
-        save_run_config(
-            run.train_cfg.out_dir, run.model_cfg, run.train_cfg, run.loss_cfg,
-            extra={
-                "stage": "finetune",
-                "environment": env,
-                "cache_dir": os.path.abspath(args.cache_dir),
-                "targets": list(targets),
-                "pretrained": os.path.abspath(args.pretrained) if args.pretrained else None,
-                "weight_transfer": (
-                    {k: v for k, v in transfer.items() if k != "pretrained_model_config"}
-                    if transfer else None
-                ),
-                "reinit_head": args.reinit_head,
-                "ema_eval": args.use_ema,
-            },
-        )
+        if run.is_main:
+            save_run_config(
+                run.train_cfg.out_dir, run.model_cfg, run.train_cfg, run.loss_cfg,
+                extra={
+                    "stage": "finetune",
+                    "environment": env,
+                    "cache_dir": os.path.abspath(args.cache_dir),
+                    "targets": list(targets),
+                    "pretrained": os.path.abspath(args.pretrained) if args.pretrained else None,
+                    "weight_transfer": (
+                        {k: v for k, v in transfer.items() if k != "pretrained_model_config"}
+                        if transfer else None
+                    ),
+                    "reinit_head": args.reinit_head,
+                    "ema_eval": args.use_ema,
+                },
+            )
 
         if args.resume:
             payload = run.trainer.load_checkpoint(args.resume)
@@ -257,16 +264,18 @@ def main(argv: list[str] | None = None) -> int:
             ).splitlines():
                 log("       " + line)
 
-        ema_path = os.path.join(run.train_cfg.out_dir, "ema_model.pt")
-        export_ema_checkpoint(run.trainer, ema_path)
-        write_json(
-            os.path.join(run.train_cfg.out_dir, "final_metrics.json"),
-            {"steps": result["steps"], "targets": list(targets), "splits": metrics,
-             "reference_split": reference_split, "measured_mae": measured,
-             "pretrained": args.pretrained, "history": result["history"][-20:]},
-        )
-        log(f"[ok  ] 结果已写入 {run.train_cfg.out_dir}")
+        if run.is_main:
+            ema_path = os.path.join(run.train_cfg.out_dir, "ema_model.pt")
+            export_ema_checkpoint(run.trainer, ema_path)
+            write_json(
+                os.path.join(run.train_cfg.out_dir, "final_metrics.json"),
+                {"steps": result["steps"], "targets": list(targets), "splits": metrics,
+                 "reference_split": reference_split, "measured_mae": measured,
+                 "pretrained": args.pretrained, "history": result["history"][-20:]},
+            )
+            log(f"[ok  ] 结果已写入 {run.train_cfg.out_dir}")
     finally:
+        ddp_cleanup(run.world_size)
         handle.close()
     return 0
 

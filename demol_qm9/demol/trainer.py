@@ -146,19 +146,52 @@ class Trainer:
         loss_cfg: LossConfig | None = None,
         standardizer: TargetStandardizer | None = None,
         device: str | torch.device = "cuda",
+        ddp: bool = False,
+        rank: int = 0,
+        local_rank: int = 0,
+        world_size: int = 1,
     ):
         self.cfg = train_cfg
         self.loss_cfg = loss_cfg or LossConfig()
-        self.device = torch.device(
-            device if torch.cuda.is_available() or str(device) == "cpu" else "cpu"
-        )
-        self.model = model.to(self.device)
+        self.ddp = ddp and world_size > 1
+        self.rank = rank
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.is_main = rank == 0
+        if self.ddp and str(device).startswith("cuda") and torch.cuda.is_available():
+            self.device = torch.device("cuda", local_rank)
+        elif self.ddp:
+            self.device = torch.device("cpu")   # gloo 后端的 CPU DDP（联调用）
+        else:
+            self.device = torch.device(
+                device if torch.cuda.is_available() or str(device) == "cpu" else "cpu"
+            )
+        self.raw_model = model.to(self.device)
+        if self.ddp:
+            # 四个任务头每步都参与损失，不存在无梯度参数，关掉 find_unused 省一次遍历。
+            from torch.nn.parallel import DistributedDataParallel
+
+            if self.device.type == "cuda":
+                self.model = DistributedDataParallel(
+                    self.raw_model,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=False,
+                )
+            else:
+                self.model = DistributedDataParallel(
+                    self.raw_model, find_unused_parameters=False
+                )
+        else:
+            self.model = self.raw_model
         self.criterion = DeMolLoss(self.loss_cfg)
         self.standardizer = standardizer
         self.no_decay = ("bias", "ln_", "layer_norm", "norm", "emb")
         self.optimizer = self._build_optimizer()
         self.scheduler = build_scheduler(self.optimizer, train_cfg)
-        self.ema = EMA(self.model, train_cfg.ema_decay) if train_cfg.ema_decay > 0 else None
+        # EMA 与检查点始终作用于 *裸* 模型：DDP 包装会给 state_dict 的 key
+        # 加上 "module." 前缀，直接存会破坏单卡恢复和微调加载。
+        self.ema = EMA(self.raw_model, train_cfg.ema_decay) if train_cfg.ema_decay > 0 else None
         self.step = 0
         self.best_metric = math.inf
         self.amp_dtype = {
@@ -175,7 +208,7 @@ class Trainer:
     # -- setup ------------------------------------------------------------
     def _build_optimizer(self) -> torch.optim.Optimizer:
         decay, no_decay = [], []
-        for name, param in self.model.named_parameters():
+        for name, param in self.raw_model.named_parameters():
             if not param.requires_grad:
                 continue
             if param.ndim <= 1 or any(tok in name for tok in self.no_decay):
@@ -225,7 +258,7 @@ class Trainer:
         self.scaler.update()
         self.scheduler.step()
         if self.ema is not None:
-            self.ema.update(self.model)
+            self.ema.update(self.raw_model)
         self.step += 1
         parts["lr"] = self.scheduler.get_last_lr()[0]
         return parts
@@ -237,7 +270,7 @@ class Trainer:
         """Validation in physical units: MAE per target plus the training loss."""
         swap = use_ema and self.ema is not None
         if swap:
-            self.ema.copy_to(self.model)
+            self.ema.copy_to(self.raw_model)
         try:
             self.model.eval()
             loss_sum, loss_n = 0.0, 0
@@ -263,7 +296,7 @@ class Trainer:
                 coord_n += int(mask.sum())
         finally:
             if swap:
-                self.ema.restore(self.model)
+                self.ema.restore(self.raw_model)
 
         pred = np.concatenate(preds, axis=0)
         gt = np.concatenate(gts, axis=0)
@@ -297,6 +330,10 @@ class Trainer:
         the run early, which is what the smoke test relies on.
         """
         log = log_fn or (lambda msg: None)
+        if not self.is_main:
+            # 非主 rank 静默跑同样的步数（DDP 集合通信要求步数对齐），
+            # 日志与检查点只由 rank 0 产出。
+            log = lambda msg: None
         history: list[dict[str, Any]] = []
         t0 = time.time()
         for batch in train_loader:
@@ -328,9 +365,11 @@ class Trainer:
 
     # -- checkpoints ------------------------------------------------------
     def save_checkpoint(self, path: str, metrics: dict[str, Any] | None = None) -> None:
+        if not self.is_main:
+            return
         payload = {
             "step": self.step,
-            "model": self.model.state_dict(),
+            "model": self.raw_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "train_config": self.cfg.to_dict(),
@@ -349,7 +388,7 @@ class Trainer:
 
     def load_checkpoint(self, path: str, restore_optimizer: bool = True) -> dict[str, Any]:
         payload = torch.load(path, map_location="cpu")
-        self.model.load_state_dict(payload["model"])
+        self.raw_model.load_state_dict(payload["model"])
         if restore_optimizer and "optimizer" in payload:
             self.optimizer.load_state_dict(payload["optimizer"])
         if "scheduler" in payload:

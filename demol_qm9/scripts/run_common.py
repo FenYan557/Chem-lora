@@ -163,6 +163,9 @@ class RunBundle:
     data: DataBundle
     standardizer: TargetStandardizer
     device: str
+    rank: int = 0
+    world_size: int = 1
+    is_main: bool = True
 
 
 def _require_cache(cache_dir: str) -> None:
@@ -178,26 +181,66 @@ def _require_cache(cache_dir: str) -> None:
 
 
 def build_run(args: argparse.Namespace, stage: str) -> RunBundle:
-    """Configs -> data -> standardiser -> model -> trainer."""
+    """Configs -> data -> standardiser -> model -> trainer.
+
+    由 torchrun 启动（``torchrun --nproc_per_node=4 ...``）时自动进入 DDP：
+    每个进程绑定 LOCAL_RANK 对应的 GPU，训练集按 rank 分片，日志与检查点
+    只由 rank 0 写出。``train_cfg.batch_size`` 是**每卡** batch，
+    全局 batch = batch_size × world_size。
+    """
     model_cfg, train_cfg, loss_cfg = build_configs(args, stage)
     _require_cache(args.cache_dir)
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp = world_size > 1
+    if ddp:
+        import torch.distributed as dist
+
+        nccl_ok = torch.cuda.is_available() and dist.is_nccl_available()
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl" if nccl_ok else "gloo")
+        if nccl_ok:
+            torch.cuda.set_device(local_rank)
     set_seed(train_cfg.seed)
-    device = resolve_device(args.device)
+    use_cuda_ddp = False
+    if ddp:
+        import torch.distributed as dist
+
+        use_cuda_ddp = torch.cuda.is_available() and dist.is_nccl_available()
+    device = f"cuda:{local_rank}" if use_cuda_ddp else resolve_device(args.device)
 
     data = build_loaders(
         args.cache_dir,
         batch_size=train_cfg.batch_size,
         num_workers=train_cfg.num_workers,
         seed=train_cfg.seed,
+        rank=rank,
+        world_size=world_size,
     )
     standardizer = fit_standardizer(data.datasets["train"])
     model = DeMol(model_cfg)
-    trainer = Trainer(model, train_cfg, loss_cfg, standardizer, device=device)
+    trainer = Trainer(
+        model, train_cfg, loss_cfg, standardizer, device=device,
+        ddp=ddp, rank=rank, local_rank=local_rank, world_size=world_size,
+    )
     return RunBundle(
         model_cfg=model_cfg, train_cfg=train_cfg, loss_cfg=loss_cfg,
-        model=trainer.model, trainer=trainer, data=data,
+        model=trainer.raw_model, trainer=trainer, data=data,
         standardizer=standardizer, device=device,
+        rank=rank, world_size=world_size, is_main=(rank == 0),
     )
+
+
+def ddp_cleanup(world_size: int) -> None:
+    """等待所有 rank 到齐后销毁进程组（单进程时是 no-op）。"""
+    if world_size <= 1:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def selected_target_names(loss_cfg: LossConfig) -> tuple[str, ...]:
@@ -222,8 +265,21 @@ def print_param_summary(model: DeMol, header: str = "model") -> dict[str, Any]:
     return summary
 
 
-def make_logger(out_dir: str, name: str = "train_log.txt") -> tuple[Callable[[str], None], Any]:
-    """Tee ``log(msg)`` to stdout and to ``out_dir/name``."""
+def make_logger(out_dir: str, name: str = "train_log.txt", enabled: bool = True) -> tuple[Callable[[str], None], Any]:
+    """Tee ``log(msg)`` to stdout and to ``out_dir/name``.
+
+    ``enabled=False``（DDP 的非主 rank）返回一个静默日志，不产生任何输出，
+    也不会去争用同一个日志文件。
+    """
+    if not enabled:
+        class _NullHandle:
+            def write(self, *a: Any, **k: Any) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        return (lambda msg: None), _NullHandle()
     os.makedirs(out_dir, exist_ok=True)
     handle = open(os.path.join(out_dir, name), "a", encoding="utf-8")
 

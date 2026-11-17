@@ -61,7 +61,7 @@ import torch  # noqa: E402
 from demol import chem, encoding, features  # noqa: E402
 from demol.benchmarks import PAPER_MODEL_PARAMS_M, comparison_table  # noqa: E402
 from demol.configs import apply_overrides, loss_config, model_config, train_config  # noqa: E402
-from demol.data import cycling_loader  # noqa: E402
+from demol.data import build_loaders, cycling_loader  # noqa: E402
 from demol.features import (  # noqa: E402
     ATOM_FIELD_SIZES,
     BOND_FIELD_SIZES,
@@ -933,10 +933,47 @@ def check_qm9_xyz_layout() -> list[str]:
     return notes
 
 
+def check_ddp_sharding() -> list[str]:
+    """DDP 训练集分片：各 rank 不相交、等长、覆盖全集，且逐 epoch 重洗。"""
+    notes: list[str] = []
+    cache_dir, _ = _build_temp_cache(12, seed=11)  # 12 个分子 -> 6 个训练样本
+    try:
+        world = 3
+        epoch_indices: list[list[list[int]]] = [[], [], []]
+        for rank in range(world):
+            bundle = build_loaders(cache_dir, batch_size=2, rank=rank, world_size=world)
+            sampler = bundle.train.sampler
+            if sampler is None or not hasattr(sampler, "set_epoch"):
+                notes.append("FAIL train loader 没有 DistributedSampler")
+                continue
+            for epoch in (0, 1):
+                sampler.set_epoch(epoch)
+                epoch_indices[rank].append(list(iter(sampler)))
+            for ds in bundle.datasets.values():
+                close = getattr(ds, "close", None)
+                if callable(close):
+                    close()
+        shards = [idx[0] for idx in epoch_indices]
+        lengths = {len(s) for s in shards}
+        if lengths != {2}:  # floor(6 / 3)
+            notes.append(f"FAIL 分片长度 {sorted(lengths)}，期望全部 2")
+        union = sorted(i for s in shards for i in s)
+        if union != list(range(6)):
+            notes.append(f"FAIL 分片并集 {union} 不是 0..5")
+        if shards[0] == epoch_indices[0][1]:
+            notes.append("FAIL set_epoch 没有改变分片顺序")
+        notes.insert(0, f"world={world} 分片不相交且覆盖 6 个训练样本（各 2 个），"
+                        "set_epoch 后顺序改变")
+    finally:
+        _cleanup([cache_dir])
+    return notes
+
+
 CHECKS: tuple[tuple[str, Callable[[], list[str]]], ...] = (
     ("bond_perception", check_bond_perception),
     ("bond_order_bands", check_bond_order_bands),
     ("qm9_xyz_layout", check_qm9_xyz_layout),
+    ("ddp_sharding", check_ddp_sharding),
     ("featurizer_vocab", check_featurizer_vocab),
     ("numpy_torch_parity", check_numpy_torch_parity),
     ("gaussian_basis", check_gaussian_basis),

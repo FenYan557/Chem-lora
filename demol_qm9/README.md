@@ -75,6 +75,12 @@ python scripts/random_probe.py --steps 60    # 可选：确认优化器真的在
 # 1) 下载 QM9（133,885 个分子，压缩包约 1.6 GB）
 python scripts/download_qm9.py --out data/qm9
 
+#    国内/服务器网络如果 figshare 不通，走 hf-mirror 的 DeepChem 镜像
+#    （内容是 qm9.sdf + qm9.sdf.csv，需要一步转换）：
+python scripts/download_qm9.py --out data/qm9 --source moldata-mirror
+python scripts/sdf_to_xyz.py --sdf data/qm9/qm9.sdf --csv data/qm9/qm9.sdf.csv `
+                             --out-dir data/qm9/dsgdb9nsd.xyz
+
 # 2) 特征化 → 缓存（全量峰值内存约 1.5 GB；先用 --limit 试跑）
 python scripts/preprocess_qm9.py --raw-dir data/qm9/dsgdb9nsd.xyz `
                                  --cache-dir data/qm9_cache
@@ -96,9 +102,34 @@ python scripts/run_finetune.py --pretrained runs/pretrain_small/ema_model.pt `
 
 ---
 
+## 多卡训练（DDP）
+
+两个入口脚本都支持 torchrun 多卡：检测到 ``RANK/WORLD_SIZE/LOCAL_RANK``
+环境变量即进入 DDP（NCCL；无 NCCL 的平台退回 gloo + CPU，仅用于联调）。
+训练集按 rank 分片、逐 epoch 重洗；日志与检查点只由 rank 0 写出；
+检查点保存的是**裸模型**（无 ``module.`` 前缀），单卡/微调可直接加载。
+
+``batch_size`` 是**每卡**的：全局 batch = batch_size × 卡数。论文全局
+batch 1024，4 卡时每卡 256：
+
+```bash
+# 先验证多卡路径（合成数据，秒级，不需要 QM9）
+python scripts/ddp_smoke.py --nproc 4 --set-train amp=bf16
+
+# 正式预训练：paper 预设 + 4 卡 DDP + bf16，全局 batch 1024，5 万步
+torchrun --nproc_per_node=4 scripts/run_pretrain.py \
+    --preset paper --cache-dir data/qm9_cache --out-dir runs/pretrain_paper \
+    --set-train batch_size=256 total_steps=50000 amp=bf16
+```
+
+EMA（decay 0.999）与 warmup 10% + 线性衰减到 0 的调度都由配置自带，
+**不需要早停**（decay-to-zero + best.pt 兜底）。
+
+---
+
 ## 把缓存传到服务器（ModelScope）
 
-DeMol 的 paper 预设（~350 M 参数）需要租大显卡训练。服务器上重新下载 1.6 GB
+DeMol 的 paper 预设（~181 M 参数）需要租大显卡训练。服务器上重新下载 1.6 GB
 原始 QM9 + 跑一遍特征化又慢又容易失败（figshare 在国内常连不上），所以缓存
 在**本地**做好，通过 ModelScope 数据集仓库中转：
 

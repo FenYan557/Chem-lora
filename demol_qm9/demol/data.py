@@ -51,19 +51,38 @@ def build_loaders(
     num_workers: int = 0,
     shuffle_train: bool = True,
     seed: int = 42,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataBundle:
     datasets = build_datasets(cache_dir)
     common = dict(collate_fn=qm9_collate, num_workers=num_workers)
     if num_workers > 0:
         common.update(persistent_workers=True, pin_memory=True)
-    generator = torch.Generator()
-    generator.manual_seed(seed)
+    sampler = None
+    generator = None
+    if world_size > 1:
+        # DDP：每个 rank 一个不相交的分片；DistributedSampler 只做索引运算，
+        # 不依赖进程组，单进程下也能用来测试分片是否正确。
+        from torch.utils.data.distributed import DistributedSampler
+
+        sampler = DistributedSampler(
+            datasets["train"],
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle_train,
+            seed=seed,
+            drop_last=True,
+        )
+    elif shuffle_train:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
     train = torch.utils.data.DataLoader(
         datasets["train"],
         batch_size=batch_size,
-        shuffle=shuffle_train,
+        shuffle=shuffle_train and sampler is None,
+        sampler=sampler,
         drop_last=True,
-        generator=generator if shuffle_train else None,
+        generator=generator,
         **common,
     )
     val = torch.utils.data.DataLoader(
@@ -76,7 +95,16 @@ def build_loaders(
 
 
 def cycling_loader(loader: torch.utils.data.DataLoader) -> Iterator[dict[str, torch.Tensor]]:
-    """Infinite iterator over ``loader`` so training is driven by step count."""
+    """Infinite iterator over ``loader`` so training is driven by step count.
+
+    With a ``DistributedSampler`` each pass calls ``set_epoch`` so every rank
+    re-shuffles its shard differently on every sweep through the dataset.
+    """
+    sampler = getattr(loader, "sampler", None)
+    epoch = 0
     while True:
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         for batch in loader:
             yield batch
+        epoch += 1
