@@ -1,0 +1,14 @@
+# DeMol QM9 复现 —— 服务器端依赖
+#
+# torch 单独装，按服务器 CUDA 版本选（https://pytorch.org/get-started/locally/），
+# 例如 CUDA 12.x：  pip install torch --index-url https://download.pytorch.org/whl/cu121
+# 本地开发环境是 torch 2.14.0+cu132 / numpy 2.4.6 / python 3.11，供参考。
+
+numpy>=1.26
+
+# 数据走 ModelScope 路线（scripts/download_modelscope.py）时才需要：
+modelscope>=1.20
+
+# 可选：装了 rdkit 则键感知用 xyz2mol（键级/芳香性更准）；
+# 不装则自动降级到纯 numpy 几何后端（Algorithm 1 + 键长比），结果略有差异。
+# rdkit

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.smoke_tmp/
+
+# 数据与产物（不入库，服务器上重新生成）
+data/
+subsets/
+test_data/
+test_subsets/
+profile_full/
+profile_preview/
+cards/
+*.npy
+*.bin
+
+# 备份与临时文件
+*.bak
+_tmp_*
