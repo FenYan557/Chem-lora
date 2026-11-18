@@ -395,6 +395,10 @@ class Trainer:
             self.scheduler.load_state_dict(payload["scheduler"])
         if self.ema is not None and "ema" in payload:
             self.ema.load_state_dict(payload["ema"])
+            # checkpoint 是 map_location="cpu" 加载的，shadow 会留在 CPU；
+            # 搬回模型所在设备，否则 resume 后第一次 ema.update 就设备不匹配
+            device = next(self.raw_model.parameters()).device
+            self.ema.shadow = {k: v.to(device) for k, v in self.ema.shadow.items()}
         self.step = int(payload.get("step", 0))
         self.best_metric = float(payload.get("best_metric", math.inf))
         if self.standardizer is None and "standardizer" in payload:
