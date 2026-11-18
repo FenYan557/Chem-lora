@@ -542,7 +542,8 @@ def qm9_collate(batch: list[dict], atom_cutoff: float = chem.ATOM_MASK_CUTOFF_AN
     spd_line = np.zeros((b, m_max, m_max), dtype=np.int64)
     bb_mask = np.zeros((b, m_max, m_max), dtype=bool)
     ab_mask = np.zeros((b, n_max, m_max), dtype=bool)
-    targets = np.zeros((b, N_TARGETS), dtype=np.float32)
+    # 目标宽度跟数据走（QM9 是 12，PCQ 微调缓存是 1），不再写死 N_TARGETS
+    targets = np.zeros((b, batch[0]["targets"].shape[0]), dtype=np.float32)
 
     for k, it in enumerate(batch):
         n, m = it["n"], it["m"]

@@ -145,6 +145,7 @@ class Trainer:
         train_cfg: TrainConfig,
         loss_cfg: LossConfig | None = None,
         standardizer: TargetStandardizer | None = None,
+        target_names: tuple[str, ...] | None = None,
         device: str | torch.device = "cuda",
         ddp: bool = False,
         rank: int = 0,
@@ -153,6 +154,9 @@ class Trainer:
     ):
         self.cfg = train_cfg
         self.loss_cfg = loss_cfg or LossConfig()
+        # 非 QM9 数据集（如 PCQM4Mv2 微调，targets 只有 gap 一列）的评估表头；
+        # None 时按 QM9 的 TARGET_NAMES 前 n 个取。
+        self.target_names = tuple(target_names) if target_names else None
         self.ddp = ddp and world_size > 1
         self.rank = rank
         self.local_rank = local_rank
@@ -301,7 +305,7 @@ class Trainer:
         pred = np.concatenate(preds, axis=0)
         gt = np.concatenate(gts, axis=0)
         mae = np.abs(pred - gt).mean(axis=0)
-        names = self._target_names(gt.shape[1])
+        names = list(self.target_names) if self.target_names else self._target_names(gt.shape[1])
         return {
             "loss": loss_sum / max(1, loss_n),
             "mae": {name: float(mae[i]) for i, name in enumerate(names)},
@@ -416,6 +420,6 @@ def summarize_model(model: DeMol) -> dict[str, Any]:
         top = name.split(".")[0]
         groups[top] = groups.get(top, 0) + param.numel()
     return {
-        "total": count_parameters(model),
+        "total": count_parameters(model, trainable_only=False),
         "by_component": dict(sorted(groups.items(), key=lambda kv: -kv[1])),
     }

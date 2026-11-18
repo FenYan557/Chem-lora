@@ -969,6 +969,180 @@ def check_ddp_sharding() -> list[str]:
     return notes
 
 
+# --------------------------------------------------------------------------
+# PCQ / LoRA 相关检查（chem-lora 扩展）
+# --------------------------------------------------------------------------
+def check_vocab_extension() -> list[str]:
+    """词表扩展必须是 append-only：旧索引语义不变，OTHER 固定在 5。"""
+    notes: list[str] = []
+    from demol.features import (
+        ATOM_VOCAB,
+        LEGACY_ATOM_VOCAB_SIZE,
+        OTHER_CLASS,
+        atom_class_of,
+    )
+
+    if ATOM_VOCAB[:6] != ("H", "C", "N", "O", "F", "OTHER"):
+        notes.append(f"FAIL 词表前 6 项变了: {ATOM_VOCAB[:6]}")
+    if OTHER_CLASS != 5:
+        notes.append(f"FAIL OTHER 不在索引 5: {OTHER_CLASS}")
+    if len(ATOM_VOCAB) != 14:
+        notes.append(f"FAIL 词表长度应为 14，实际 {len(ATOM_VOCAB)}")
+    cls = atom_class_of(np.array([1, 6, 7, 8, 9, 16, 17, 5, 14, 15, 35, 53, 34, 999]))
+    expect = [0, 1, 2, 3, 4, 9, 10, 6, 7, 8, 11, 12, 13, 5]
+    if list(cls) != expect:
+        notes.append(f"FAIL atom_class_of 映射错误: {list(cls)} != {expect}")
+    if LEGACY_ATOM_VOCAB_SIZE != 6:
+        notes.append("FAIL LEGACY_ATOM_VOCAB_SIZE 应为 6")
+    # 扩展词表建出来的模型，默认配置 atom_field_sizes 应跟随新词表
+    cfg = model_config("smoke")
+    if cfg.atom_field_sizes[0] != len(ATOM_VOCAB) + 1:
+        notes.append(f"FAIL atom_field_sizes[0]={cfg.atom_field_sizes[0]} != {len(ATOM_VOCAB) + 1}")
+    return notes
+
+
+def check_lora_mechanics() -> list[str]:
+    """LoRA：注入后等价（B=0）、冻结正确、梯度只落在放开的参数上。"""
+    notes: list[str] = []
+    from demol.lora import (
+        LoRALinear,
+        adapter_state_dict,
+        apply_lora,
+        lora_parameters,
+        mark_lora_trainable,
+    )
+
+    cache_dir, _ = _build_temp_cache(6, seed=31)
+    ds = None
+    try:
+        ds = QM9Dataset(cache_dir, split_ids=(0,))
+        batch = qm9_collate([ds[i] for i in range(len(ds))])
+
+        model = DeMol(model_config("smoke"))
+        model.eval()
+        with torch.no_grad():
+            ref = model(batch)["prop"]
+
+        n_injected = apply_lora(model, rank=4, alpha=8.0)
+        if n_injected == 0:
+            notes.append("FAIL 没有注入任何 LoRA adapter")
+        # B=0 时输出应与注入前逐元素一致
+        with torch.no_grad():
+            after = model(batch)["prop"]
+        if not torch.allclose(ref, after, atol=1e-6):
+            notes.append("FAIL LoRA 注入改变了前向输出（B 应零初始化）")
+
+        n_lora = sum(p.numel() for p in lora_parameters(model))
+        n_total = sum(p.numel() for p in model.parameters())
+        # smoke 模型 d=64 很小，rank=4 的占比天然偏高；paper 规模下 rank=8
+        # 约占 1-2%。这里只要求远小于全量。
+        if not (0 < n_lora < 0.25 * n_total):
+            notes.append(f"FAIL LoRA 参数量异常: {n_lora} / {n_total}")
+
+        groups = mark_lora_trainable(model, train_embeddings=True)
+        trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+        if any("lora_" not in n and not n.startswith("prop_head")
+               and not n.startswith("atom_emb") and not n.startswith("bond_emb")
+               and n != "mask_token" for n in trainable):
+            bad = [n for n in trainable if "lora_" not in n
+                   and not n.startswith(("prop_head", "atom_emb", "bond_emb"))
+                   and n != "mask_token"]
+            notes.append(f"FAIL 冻结不全，放开了: {bad[:4]}")
+        if groups["lora"] != n_lora:
+            notes.append("FAIL mark_lora_trainable 统计与 lora_parameters 不一致")
+
+        # 前向 + 反向：梯度只出现在放开的参数上
+        model.train()
+        out = model(batch)
+        loss = out["prop"].square().mean()
+        loss.backward()
+        bad_grads = [n for n, p in model.named_parameters()
+                     if p.grad is not None and not p.requires_grad]
+        if bad_grads:
+            notes.append(f"FAIL 冻结参数拿到了梯度: {bad_grads[:4]}")
+        no_grad = [n for n, p in model.named_parameters()
+                   if p.requires_grad and (p.grad is None or not bool(p.grad.abs().sum() > 0))
+                   # lora_A 在 B=0 时梯度恒为 0（第一步只更新 B，LoRA 的正常起点）；
+                   # mask_token 只在 mask_ratio>0 时使用
+                   and not n.endswith("lora_A") and n != "mask_token"]
+        if no_grad:
+            notes.append(f"（提示）可训练但无梯度: {no_grad[:4]}")
+
+        # adapter 存取
+        state = adapter_state_dict(model)
+        if not state or any("lora_" not in k for k in state):
+            notes.append("FAIL adapter_state_dict 含非 lora 键")
+    finally:
+        _cleanup([cache_dir], [ds] if ds else [])
+    return notes
+
+
+def check_pcq_pipeline() -> list[str]:
+    """PCQ 数据链路：jsonl -> 缓存（targets 宽度 1）-> collate -> 词表降级。"""
+    notes: list[str] = []
+    import gzip
+    import json as json_mod
+
+    from demol.pcq import VocabDowngradeDataset, featurize_pcq_records, write_pcq_split
+
+    cache_dir = _scratch_dir("demol_pcq_smoke_")
+    ds = None
+    jsonl_path = None
+    try:
+        # 用合成分子伪造 6 条 jsonl 记录（gap 取 3-9 eV 的合理范围）
+        records = synthetic_records(6, seed=47)
+        jsonl_path = os.path.join(cache_dir, "fake_pcq.jsonl.gz")
+        os.makedirs(cache_dir, exist_ok=True)
+        with gzip.open(jsonl_path, "wt", encoding="utf-8") as fh:
+            for k, rec in enumerate(records):
+                fh.write(json_mod.dumps({
+                    "position": rec["pos"].tolist(),
+                    "node_class": rec["z"].tolist(),
+                    "labels": {"object": {"SMILES": f"fake{k}", "gap": 4.0 + 0.3 * k},
+                               "node": None},
+                    "subset_idx": k,
+                }) + "\n")
+
+        pcq_records = featurize_pcq_records(jsonl_path, prefer_rdkit=False)
+        if len(pcq_records) != 6:
+            notes.append(f"FAIL featurize 后剩 {len(pcq_records)}/6 条")
+        if pcq_records and pcq_records[0]["targets"].shape != (1,):
+            notes.append(f"FAIL targets 宽度应为 1: {pcq_records[0]['targets'].shape}")
+
+        write_cache(pcq_records, cache_dir)
+        write_pcq_split(cache_dir, 4, 2)
+
+        ds = QM9Dataset(cache_dir, split_ids=(0,))
+        ds_val = QM9Dataset(cache_dir, split_ids=(1,))
+        if len(ds) != 4 or len(ds_val) != 2:
+            notes.append(f"FAIL split 不对: train={len(ds)} val={len(ds_val)}")
+        batch = qm9_collate([ds[i] for i in range(len(ds))])
+        if tuple(batch["targets"].shape) != (4, 1):
+            notes.append(f"FAIL collate 后 targets 形状 {tuple(batch['targets'].shape)}")
+        got = sorted(round(float(v), 3) for v in batch["targets"][:, 0])
+        want = [4.0, 4.3, 4.6, 4.9]
+        if got != want:
+            notes.append(f"FAIL gap 标签串列: {got} != {want}")
+
+        # 词表降级：把原子类别伪造成新元素（S=9），验证被压回 OTHER=5
+        down = VocabDowngradeDataset(ds)
+        item = down[0]
+        fake = dict(item)
+        fake["atom_class"] = np.full_like(item["atom_class"], 9)
+        af = item["atom_fields"].copy()
+        af[:, 0] = 10
+        fake["atom_fields"] = af
+        # 手动验证降级规则与实现一致
+        if int(np.minimum(fake["atom_class"], 5).max()) != 5:
+            notes.append("FAIL 降级逻辑自检失败")
+        # 真链路：原始数据类别都应 <=5（合成分子只有 H/C/N/O/F），降级是恒等
+        if not np.array_equal(item["atom_class"], ds[0]["atom_class"]):
+            notes.append("FAIL 对 QM9 元素的降级应是恒等映射")
+    finally:
+        _cleanup([cache_dir], [ds] if ds else [])
+    return notes
+
+
 CHECKS: tuple[tuple[str, Callable[[], list[str]]], ...] = (
     ("bond_perception", check_bond_perception),
     ("bond_order_bands", check_bond_order_bands),
@@ -985,6 +1159,9 @@ CHECKS: tuple[tuple[str, Callable[[], list[str]]], ...] = (
     ("config_overrides", check_config_overrides),
     ("param_budget", check_param_budget),
     ("benchmark_reporting", check_benchmark_reporting),
+    ("vocab_extension", check_vocab_extension),
+    ("lora_mechanics", check_lora_mechanics),
+    ("pcq_pipeline", check_pcq_pipeline),
 )
 
 

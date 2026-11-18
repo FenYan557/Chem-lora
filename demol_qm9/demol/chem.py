@@ -28,7 +28,7 @@ DEFAULT_COVALENT_RADIUS = 1.5
 
 ELEMENT_SYMBOL = {
     1: "H", 5: "B", 6: "C", 7: "N", 8: "O", 9: "F", 14: "Si", 15: "P",
-    16: "S", 17: "Cl", 35: "Br", 53: "I",
+    16: "S", 17: "Cl", 34: "Se", 35: "Br", 53: "I",
 }
 SYMBOL_TO_Z = {v: k for k, v in ELEMENT_SYMBOL.items()}
 

@@ -86,6 +86,11 @@ def load_pretrained_weights(
     ``strict=False`` 仍然会在**形状不一致**时报错，而微调时属性头、乃至
     ``n_targets`` 都可能与预训练不同，所以这里先按名字+形状筛一遍再加载，
     并把筛掉/缺失的键如实汇报出来。
+
+    词表扩展（6 类 -> 14 类）造成的"前缀兼容"张量——嵌入表、Gaussian
+    basis 的逐类别 alpha/beta 表——做前缀复制：旧类别索引语义不变
+    （append-only），新增行保持随机初始化。每个维度都要求检查点尺寸
+    <= 模型尺寸才允许前缀复制，否则跳过。
     """
     payload = _load_payload(path)
     weights = dict(payload.get("model", payload))
@@ -94,10 +99,26 @@ def load_pretrained_weights(
 
     own = model.state_dict()
     kept: dict[str, torch.Tensor] = {}
+    prefix_copied: list[dict[str, Any]] = []
     mismatched: list[dict[str, Any]] = []
     for key, value in weights.items():
         if key in own and tuple(own[key].shape) == tuple(value.shape):
             kept[key] = value
+        elif (
+            key in own
+            and own[key].ndim == value.ndim
+            and all(v <= o for v, o in zip(value.shape, own[key].shape))
+        ):
+            # 前缀复制：老权重填进新张量的左上角，其余保持初始化值
+            new_value = own[key].clone()
+            slices = tuple(slice(0, s) for s in value.shape)
+            new_value[slices] = value
+            kept[key] = new_value
+            prefix_copied.append({
+                "key": key,
+                "checkpoint_shape": tuple(value.shape),
+                "model_shape": tuple(own[key].shape),
+            })
         else:
             mismatched.append({
                 "key": key,
@@ -108,6 +129,7 @@ def load_pretrained_weights(
     return {
         "loaded": len(kept),
         "total_in_checkpoint": len(weights),
+        "prefix_copied": prefix_copied,
         "skipped_shape_mismatch": mismatched,
         "missing": list(result.missing_keys),
         "unexpected": list(result.unexpected_keys),
@@ -129,6 +151,10 @@ def reinit_prop_head(model: DeMol) -> None:
 def _summarize_transfer(info: dict[str, Any], log) -> None:
     log(f"[init] 载入预训练权重: {info['loaded']}/{info['total_in_checkpoint']} 个张量"
         + ("（EMA）" if info["used_ema"] else ""))
+    if info.get("prefix_copied"):
+        log(f"[init] 前缀复制（词表扩展）{len(info['prefix_copied'])} 个: "
+            + ", ".join(f"{d['key']} {d['checkpoint_shape']}->{d['model_shape']}"
+                        for d in info["prefix_copied"][:6]))
     if info["skipped_shape_mismatch"]:
         log(f"[init] 形状不匹配被跳过 {len(info['skipped_shape_mismatch'])} 个: "
             + ", ".join(d["key"] for d in info["skipped_shape_mismatch"][:6]))

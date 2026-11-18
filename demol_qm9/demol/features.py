@@ -32,7 +32,13 @@ from . import chem
 # --------------------------------------------------------------------------
 # Vocabularies.  Field value 0 == PAD, so real values start at 1.
 # --------------------------------------------------------------------------
-ATOM_VOCAB = ("H", "C", "N", "O", "F", "OTHER")           # element classes
+# 元素词表，**只允许追加，不允许重排**：QM9 检查点/缓存里的类别索引按旧
+# 顺序解释，append-only 保证旧索引语义不变（OTHER 固定在索引 5）。
+# 后 8 个是 PCQM4Mv2 里出现而 QM9 没有的元素（LoRA 微调用）。
+ATOM_VOCAB = (
+    "H", "C", "N", "O", "F", "OTHER",
+    "B", "Si", "P", "S", "Cl", "Br", "I", "Se",
+)
 
 ATOM_FIELDS: tuple[tuple[str, int], ...] = (
     ("type", len(ATOM_VOCAB) + 1),        # 7
@@ -60,9 +66,17 @@ ATOM_FIELD_SIZES = tuple(size for _, size in ATOM_FIELDS)
 BOND_FIELD_SIZES = tuple(size for _, size in BOND_FIELDS)
 
 # Element -> class index used for the Gaussian-basis alpha/beta lookup.
-_Z_TO_CLASS = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}
+_Z_TO_CLASS = {
+    1: 0, 6: 1, 7: 2, 8: 3, 9: 4,          # H C N O F
+    5: 6, 14: 7, 15: 8, 16: 9, 17: 10, 35: 11, 53: 12, 34: 13,  # B Si P S Cl Br I Se
+}
 N_ATOM_CLASSES = len(ATOM_VOCAB)
 N_BOND_CLASSES = len(BOND_TYPES) + 1     # + pad/unknown
+
+# 词表扩展前的旧布局（QM9 预训练检查点）：零样本跨数据集评估时把
+# 新元素类别降级回 OTHER。
+LEGACY_ATOM_VOCAB_SIZE = 6               # ("H","C","N","O","F","OTHER")
+OTHER_CLASS = ATOM_VOCAB.index("OTHER")  # 5
 
 HYBRID_UNKNOWN, HYBRID_S, HYBRID_SP, HYBRID_SP2, HYBRID_SP3 = 1, 2, 3, 4, 5
 
@@ -84,7 +98,7 @@ class MolFeatures:
 
 def atom_class_of(atomic_numbers: np.ndarray) -> np.ndarray:
     z = np.asarray(atomic_numbers)
-    out = np.full(z.shape, len(ATOM_VOCAB) - 1, dtype=np.int64)   # OTHER
+    out = np.full(z.shape, OTHER_CLASS, dtype=np.int64)           # OTHER
     for zi, cls in _Z_TO_CLASS.items():
         out[z == zi] = cls
     return out
