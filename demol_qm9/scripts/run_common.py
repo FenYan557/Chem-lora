@@ -337,12 +337,12 @@ def export_ema_checkpoint(trainer: Trainer, path: str) -> bool:
     """
     if trainer.ema is None:
         return False
-    state = {k: v.detach().clone() for k, v in trainer.model.state_dict().items()}
+    state = {k: v.detach().clone() for k, v in trainer.raw_model.state_dict().items()}
     state.update({
         k: v.to(state[k].dtype) for k, v in trainer.ema.shadow.items() if k in state
     })
     torch.save(
-        {"model": state, "step": trainer.step, "model_config": trainer.model.cfg.to_dict()},
+        {"model": state, "step": trainer.step, "model_config": trainer.raw_model.cfg.to_dict()},
         path,
     )
     return True
