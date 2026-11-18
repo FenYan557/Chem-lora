@@ -34,16 +34,16 @@ EXPECTED_ELEMENTS = {"H", "C", "N", "O", "F"}
 
 
 def load_properties(csv_path: str) -> dict[int, str]:
-    """mol_id ("gdb_1") -> the 20 property values as one space-joined string."""
+    """mol_id ("gdb_1") -> the 19 property values as one space-joined string."""
     props: dict[int, str] = {}
     with open(csv_path, "r", encoding="utf-8") as fh:
         header = fh.readline().strip().split(",")
-        if header[0] != "mol_id" or len(header) != 21:
+        if header[0] != "mol_id" or len(header) != 20:
             raise ValueError(f"unexpected csv header: {header}")
         for lineno, line in enumerate(fh, start=2):
             parts = line.rstrip("\n").split(",")
-            if len(parts) != 21:
-                raise ValueError(f"{csv_path}:{lineno}: expected 21 columns, got {len(parts)}")
+            if len(parts) != 20:
+                raise ValueError(f"{csv_path}:{lineno}: expected 20 columns, got {len(parts)}")
             mol_id = parts[0]
             idx = int(mol_id.split("_")[1])
             props[idx] = " ".join(parts[1:])

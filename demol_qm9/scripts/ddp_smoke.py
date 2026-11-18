@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import subprocess
 import sys
 
@@ -48,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd = [
         sys.executable, "-m", "torch.distributed.run",
         f"--nproc_per_node={args.nproc}",
+        f"--master_port={random.randint(29600, 29900)}",
         os.path.join(_HERE, "run_pretrain.py"),
         "--preset", "smoke",
         "--cache-dir", cache,

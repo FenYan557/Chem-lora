@@ -374,7 +374,7 @@ class Trainer:
             "scheduler": self.scheduler.state_dict(),
             "train_config": self.cfg.to_dict(),
             "loss_config": asdict(self.loss_cfg),
-            "model_config": self.model.cfg.to_dict(),
+            "model_config": self.raw_model.cfg.to_dict(),
             "best_metric": self.best_metric,
             "metrics": metrics,
         }

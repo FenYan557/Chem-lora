@@ -190,6 +190,13 @@ def build_run(args: argparse.Namespace, stage: str) -> RunBundle:
     """
     model_cfg, train_cfg, loss_cfg = build_configs(args, stage)
     _require_cache(args.cache_dir)
+    if os.environ.get("DEMOL_FAULT_HANDLER"):
+        # 调试钩子：kill -USR1 <pid> 可向 stderr 转储所有线程栈。
+        import faulthandler
+        import signal
+
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1)
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -233,13 +240,17 @@ def build_run(args: argparse.Namespace, stage: str) -> RunBundle:
 
 
 def ddp_cleanup(world_size: int) -> None:
-    """等待所有 rank 到齐后销毁进程组（单进程时是 no-op）。"""
+    """销毁进程组（单进程时是 no-op）。
+
+    刻意不做 barrier：非主 rank 不碰任何文件，无需等待；若某个 rank 在
+    训练中抛异常，finally 里的 barrier 会把 traceback 永远憋在异常传播
+    之前，毁掉现场。
+    """
     if world_size <= 1:
         return
     import torch.distributed as dist
 
     if dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 
